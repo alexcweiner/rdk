@@ -769,6 +769,9 @@ type sharedInputs struct {
 }
 
 // promptSharedInputs prompts for visibility, namespace, and registration — shared across module and app flows.
+// The namespace field stays a free-text input (namespace, org name, or org ID) so existing
+// interactive and scripted flows that type a value keep working. Org listing is used only
+// for suggestions; a picker is offered later if lookup fails while registering.
 func promptSharedInputs(ctx context.Context, cmd *cli.Command, c *viamClient, shared *sharedInputs) error {
 	var registerWidget huh.Field
 	if unauthenticatedMode {
@@ -789,76 +792,50 @@ func promptSharedInputs(ctx context.Context, cmd *cli.Command, c *viamClient, sh
 			Value(&shared.RegisterOnApp)
 	}
 
-	fields := []huh.Field{}
-	if shared.Visibility == "" {
-		fields = append(fields, huh.NewSelect[string]().
-			Title("Visibility:").
-			Options(
-				huh.NewOption("Public", moduleVisibilityPublic),
-				huh.NewOption("Private", moduleVisibilityPrivate),
-				huh.NewOption("Public Unlisted", moduleVisibilityPublicUnlisted),
-			).
-			Value(&shared.Visibility))
-	}
-
-	var selectedOrgID string
-	orgsByID := map[string]*apppb.Organization{}
-	useOrgPicker := false
-	if shared.Namespace == "" && !unauthenticatedMode && c != nil && c.client != nil {
-		orgs, err := c.listOrganizations(ctx)
-		if err != nil {
-			warningf(cmd.Root().Writer, "Could not list organizations (%v); enter a namespace or org ID instead", err)
-		} else if len(orgs) > 0 {
-			useOrgPicker = true
-			opts := make([]huh.Option[string], 0, len(orgs))
-			for _, org := range orgs {
-				orgsByID[org.GetId()] = org
-				opts = append(opts, huh.NewOption(orgChoiceLabel(org), org.GetId()))
+	namespaceInput := huh.NewInput().
+		Title("Namespace/Organization ID").
+		Description("Public namespace, organization name, or org ID.").
+		Value(&shared.Namespace).
+		Placeholder("my-namespace").
+		Validate(func(s string) error {
+			if s == "" {
+				return errors.New("namespace or org ID must not be empty")
 			}
-			fields = append(fields, huh.NewSelect[string]().
-				Title("Organization").
-				Description("Modules are registered under your organization's public namespace.\n"+
-					"If an org has none yet, you can set one in the next step.").
-				Options(opts...).
-				Value(&selectedOrgID))
+			return nil
+		})
+	if !unauthenticatedMode && c != nil && c.client != nil {
+		if orgs, err := c.listOrganizations(ctx); err != nil {
+			warningf(cmd.Root().Writer, "Could not list organizations (%v); type a namespace, org name, or org ID", err)
+		} else if len(orgs) > 0 {
+			suggestions := make([]string, 0, len(orgs)*2)
+			for _, org := range orgs {
+				if ns := org.GetPublicNamespace(); ns != "" {
+					suggestions = append(suggestions, ns)
+				}
+				if name := org.GetName(); name != "" {
+					suggestions = append(suggestions, name)
+				}
+			}
+			namespaceInput = namespaceInput.Suggestions(suggestions)
 		}
 	}
-	if shared.Namespace == "" && !useOrgPicker {
-		fields = append(fields, huh.NewInput().
-			Title("Namespace/Organization ID").
-			Description("Your org's public namespace, name, or ID.").
-			Value(&shared.Namespace).
-			Placeholder("my-namespace").
-			Validate(func(s string) error {
-				if s == "" {
-					return errors.New("namespace or org ID must not be empty")
-				}
-				return nil
-			}))
-	}
 
-	fields = append(fields, registerWidget)
-	form := huh.NewForm(huh.NewGroup(fields...)).WithHeight(25).WithWidth(88)
+	form := huh.NewForm(
+		huh.NewGroup(
+			huh.NewSelect[string]().
+				Title("Visibility:").
+				Options(
+					huh.NewOption("Public", moduleVisibilityPublic),
+					huh.NewOption("Private", moduleVisibilityPrivate),
+					huh.NewOption("Public Unlisted", moduleVisibilityPublicUnlisted),
+				).
+				Value(&shared.Visibility),
+			namespaceInput,
+			registerWidget,
+		),
+	).WithHeight(25).WithWidth(88)
 	if err := form.Run(); err != nil {
 		return errors.Wrap(err, "encountered an error in shared prompts")
-	}
-
-	if useOrgPicker {
-		org := orgsByID[selectedOrgID]
-		if org == nil {
-			return errors.New("no organization selected")
-		}
-		if org.GetPublicNamespace() != "" {
-			shared.Namespace = org.GetPublicNamespace()
-		} else if !shared.RegisterOnApp {
-			shared.Namespace = sanitizeNamespace(org.GetName())
-			if shared.Namespace == "" {
-				shared.Namespace = org.GetId()
-			}
-		} else {
-			// wrapResolveOrg will match this ID and prompt to set a public namespace.
-			shared.Namespace = org.GetId()
-		}
 	}
 	return nil
 }
