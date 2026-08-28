@@ -129,27 +129,54 @@ func TestWrapResolveOrg(t *testing.T) {
 		test.That(t, ac.conf.RecentModuleNamespaces, test.ShouldResemble, []string{"otf"})
 	})
 
-	t.Run("org name without namespace is a clear error, not membership", func(t *testing.T) {
-		cCtx, ac, _, _ := setup(listOrgs([]*apppb.Organization{
-			{Id: "11111111-1111-1111-1111-111111111111", Name: "otf", PublicNamespace: ""},
-		}), nil, nil, nil, "token")
+	t.Run("sets namespace on a matching org that has none", func(t *testing.T) {
+		orgID := "11111111-1111-1111-1111-111111111111"
+		asc := listOrgs([]*apppb.Organization{
+			{Id: orgID, Name: "otf", PublicNamespace: ""},
+		})
+		asc.UpdateOrganizationFunc = func(ctx context.Context, in *apppb.UpdateOrganizationRequest,
+			opts ...grpc.CallOption,
+		) (*apppb.UpdateOrganizationResponse, error) {
+			test.That(t, in.GetOrganizationId(), test.ShouldEqual, orgID)
+			test.That(t, in.GetPublicNamespace(), test.ShouldEqual, "otf")
+			return &apppb.UpdateOrganizationResponse{
+				Organization: &apppb.Organization{Id: orgID, Name: "otf", PublicNamespace: "otf"},
+			}, nil
+		}
+		cCtx, ac, out, _ := setup(asc, nil, nil, nil, "token")
 		mod := &modulegen.ModuleInputs{Namespace: "otf", RegisterOnApp: true}
-		err := wrapResolveOrg(context.Background(), cCtx, ac, mod)
-		test.That(t, err, test.ShouldNotBeNil)
-		test.That(t, err.Error(), test.ShouldContainSubstring, "no public namespace")
-		test.That(t, err.Error(), test.ShouldContainSubstring, "Settings")
-		test.That(t, err.Error(), test.ShouldNotContainSubstring, "not a member")
-		test.That(t, len(ac.conf.RecentModuleNamespaces), test.ShouldEqual, 0)
+		test.That(t, wrapResolveOrg(context.Background(), cCtx, ac, mod), test.ShouldBeNil)
+		test.That(t, mod.OrgID, test.ShouldEqual, orgID)
+		test.That(t, mod.Namespace, test.ShouldEqual, "otf")
+		test.That(t, strings.Join(out.messages, ""), test.ShouldContainSubstring, `Set public namespace "otf"`)
 	})
 
-	t.Run("unknown identifier lists orgs and does not claim non-membership", func(t *testing.T) {
-		cCtx, ac, _, _ := setup(listOrgs(testOrgs()), nil, nil, nil, "token")
+	t.Run("creates an org when the namespace is new", func(t *testing.T) {
+		createdID := "44444444-4444-4444-4444-444444444444"
+		asc := listOrgs(testOrgs())
+		asc.CreateOrganizationFunc = func(ctx context.Context, in *apppb.CreateOrganizationRequest,
+			opts ...grpc.CallOption,
+		) (*apppb.CreateOrganizationResponse, error) {
+			test.That(t, in.GetName(), test.ShouldEqual, "nope")
+			return &apppb.CreateOrganizationResponse{
+				Organization: &apppb.Organization{Id: createdID, Name: "nope", PublicNamespace: ""},
+			}, nil
+		}
+		asc.UpdateOrganizationFunc = func(ctx context.Context, in *apppb.UpdateOrganizationRequest,
+			opts ...grpc.CallOption,
+		) (*apppb.UpdateOrganizationResponse, error) {
+			test.That(t, in.GetOrganizationId(), test.ShouldEqual, createdID)
+			test.That(t, in.GetPublicNamespace(), test.ShouldEqual, "nope")
+			return &apppb.UpdateOrganizationResponse{
+				Organization: &apppb.Organization{Id: createdID, Name: "nope", PublicNamespace: "nope"},
+			}, nil
+		}
+		cCtx, ac, out, _ := setup(asc, nil, nil, nil, "token")
 		mod := &modulegen.ModuleInputs{Namespace: "nope", RegisterOnApp: true}
-		err := wrapResolveOrg(context.Background(), cCtx, ac, mod)
-		test.That(t, err, test.ShouldNotBeNil)
-		test.That(t, err.Error(), test.ShouldContainSubstring, `none of your organizations match "nope"`)
-		test.That(t, err.Error(), test.ShouldContainSubstring, "Acme")
-		test.That(t, err.Error(), test.ShouldNotContainSubstring, "not a member")
+		test.That(t, wrapResolveOrg(context.Background(), cCtx, ac, mod), test.ShouldBeNil)
+		test.That(t, mod.OrgID, test.ShouldEqual, createdID)
+		test.That(t, mod.Namespace, test.ShouldEqual, "nope")
+		test.That(t, strings.Join(out.messages, ""), test.ShouldContainSubstring, `Created organization "nope"`)
 	})
 
 	t.Run("skips cloud resolve when not registering", func(t *testing.T) {
@@ -170,10 +197,6 @@ func TestRecentModuleNamespaces(t *testing.T) {
 	test.That(t, recentNamespaceHint(nil), test.ShouldEqual, "")
 	test.That(t, recentNamespaceHint([]string{"otf", "acme"}), test.ShouldEqual, "Recently used: otf, acme")
 	test.That(t, dedupeKeepOrder([]string{"otf", "OTF", "acme", ""}), test.ShouldResemble, []string{"otf", "acme"})
-	test.That(t, namespaceChoiceText([]string{"otf"}, testOrgs()), test.ShouldContainSubstring, "Recently used: otf")
-	test.That(t, namespaceChoiceText([]string{"otf"}, testOrgs()), test.ShouldContainSubstring, "Your organizations:")
-	test.That(t, namespaceChoiceText([]string{"otf"}, testOrgs()), test.ShouldContainSubstring, "namespace: acme")
-	test.That(t, firstOrgNamespace(testOrgs()), test.ShouldEqual, "acme")
 }
 
 func TestRecentModuleNamespacesFile(t *testing.T) {

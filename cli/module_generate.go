@@ -770,9 +770,7 @@ type sharedInputs struct {
 }
 
 // promptSharedInputs prompts for visibility, namespace, and registration — shared across module and app flows.
-// The namespace field stays a free-text input (namespace, org name, or org ID) so existing
-// interactive and scripted flows that type a value keep working. Org listing is used only
-// for suggestions; a picker is offered later if lookup fails while registering.
+// Namespace stays a free-text field. Recents are shown in the description above the cursor.
 func promptSharedInputs(ctx context.Context, cmd *cli.Command, c *viamClient, shared *sharedInputs) error {
 	var registerWidget huh.Field
 	if unauthenticatedMode {
@@ -793,50 +791,29 @@ func promptSharedInputs(ctx context.Context, cmd *cli.Command, c *viamClient, sh
 			Value(&shared.RegisterOnApp)
 	}
 
-	namespaceDesc := "Public namespace, organization name, or org ID. You can type it."
-	placeholder := "my-namespace"
-	suggestions := []string{}
-	var orgs []*apppb.Organization
-	if !unauthenticatedMode && c != nil && c.client != nil {
-		listed, err := c.listOrganizations(ctx)
-		if err != nil {
-			warningf(cmd.Root().Writer, "Could not list organizations (%v); type a namespace, org name, or org ID", err)
-		} else {
-			orgs = listed
-		}
-	}
-
 	recent := readRecentModuleNamespaces()
 	if len(recent) == 0 && c != nil && c.conf != nil {
 		recent = c.conf.RecentModuleNamespaces
 	}
+
+	namespaceDesc := "Type a namespace. New ones are created if needed."
+	placeholder := "my-namespace"
 	if hint := recentNamespaceHint(recent); hint != "" {
-		// huh only reliably shows a single description line on the input.
-		namespaceDesc = hint + ". You can type it."
-	}
-	if len(recent) > 0 {
+		namespaceDesc = hint
 		placeholder = recent[0]
-		suggestions = append(suggestions, recent...)
-	}
-	for _, org := range orgs {
-		if ns := org.GetPublicNamespace(); ns != "" {
-			suggestions = append(suggestions, ns)
-		}
-		if name := org.GetName(); name != "" {
-			suggestions = append(suggestions, name)
-		}
-	}
-	if placeholder == "my-namespace" {
-		if ns := firstOrgNamespace(orgs); ns != "" {
-			placeholder = ns
-		}
 	}
 
-	fields := []huh.Field{}
-	if note := namespaceChoiceText(recent, orgs); note != "" {
-		fields = append(fields, huh.NewNote().
-			Title("Type a namespace, org name, or org ID below").
-			Description(note))
+	suggestions := append([]string{}, recent...)
+	if !unauthenticatedMode && c != nil && c.client != nil {
+		if orgs, err := c.listOrganizations(ctx); err != nil {
+			warningf(cmd.Root().Writer, "Could not list organizations (%v); type a namespace", err)
+		} else {
+			for _, org := range orgs {
+				if ns := org.GetPublicNamespace(); ns != "" {
+					suggestions = append(suggestions, ns)
+				}
+			}
+		}
 	}
 
 	namespaceInput := huh.NewInput().
@@ -845,7 +822,7 @@ func promptSharedInputs(ctx context.Context, cmd *cli.Command, c *viamClient, sh
 		Value(&shared.Namespace).
 		Placeholder(placeholder).
 		Validate(func(s string) error {
-			if s == "" {
+			if strings.TrimSpace(s) == "" {
 				return errors.New("namespace or org ID must not be empty")
 			}
 			return nil
@@ -853,20 +830,21 @@ func promptSharedInputs(ctx context.Context, cmd *cli.Command, c *viamClient, sh
 	if len(suggestions) > 0 {
 		namespaceInput = namespaceInput.Suggestions(dedupeKeepOrder(suggestions))
 	}
-	fields = append(fields,
-		huh.NewSelect[string]().
-			Title("Visibility:").
-			Options(
-				huh.NewOption("Public", moduleVisibilityPublic),
-				huh.NewOption("Private", moduleVisibilityPrivate),
-				huh.NewOption("Public Unlisted", moduleVisibilityPublicUnlisted),
-			).
-			Value(&shared.Visibility),
-		namespaceInput,
-		registerWidget,
-	)
 
-	form := huh.NewForm(huh.NewGroup(fields...)).WithHeight(28).WithWidth(88)
+	form := huh.NewForm(
+		huh.NewGroup(
+			huh.NewSelect[string]().
+				Title("Visibility:").
+				Options(
+					huh.NewOption("Public", moduleVisibilityPublic),
+					huh.NewOption("Private", moduleVisibilityPrivate),
+					huh.NewOption("Public Unlisted", moduleVisibilityPublicUnlisted),
+				).
+				Value(&shared.Visibility),
+			namespaceInput,
+			registerWidget,
+		),
+	).WithHeight(25).WithWidth(88)
 	if err := form.Run(); err != nil {
 		return errors.Wrap(err, "encountered an error in shared prompts")
 	}
@@ -1018,75 +996,39 @@ func wrapResolveOrg(ctx context.Context, cmd *cli.Command, c *viamClient, newMod
 		return nil
 	}
 
-	org, err := resolveOrgForModule(ctx, cmd, c, newModule.Namespace)
+	org, err := resolveOrCreateOrg(ctx, cmd, c, strings.TrimSpace(newModule.Namespace))
 	if err != nil {
 		return catchResolveOrgErr(ctx, cmd, c, newModule, err)
 	}
 	newModule.OrgID = org.GetId()
-	if ns := org.GetPublicNamespace(); ns != "" {
-		newModule.Namespace = ns
-		rememberRecentModuleNamespace(c, newModule.Namespace)
-		return nil
-	}
-	org, err = ensureOrgPublicNamespace(ctx, cmd, c, org, suggestedNamespace(newModule.Namespace, org))
-	if err != nil {
-		return err
-	}
-	newModule.OrgID = org.GetId()
 	newModule.Namespace = org.GetPublicNamespace()
+	if newModule.Namespace == "" {
+		return errors.Errorf("organization %q has no public namespace", org.GetName())
+	}
 	rememberRecentModuleNamespace(c, newModule.Namespace)
 	return nil
 }
 
-func resolveOrgForModule(ctx context.Context, cmd *cli.Command, c *viamClient, identifier string) (*apppb.Organization, error) {
+func resolveOrCreateOrg(ctx context.Context, cmd *cli.Command, c *viamClient, identifier string) (*apppb.Organization, error) {
+	if identifier == "" {
+		return nil, errors.New("must provide a namespace, organization name, or org ID")
+	}
 	orgs, err := c.listOrganizations(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(identifier) != "" {
-		org, err := findUserOrg(orgs, identifier)
-		if err == nil {
+	org, err := findUserOrg(orgs, identifier)
+	if err == nil {
+		if org.GetPublicNamespace() != "" {
 			return org, nil
 		}
-		if !isInteractive() {
-			return nil, err
-		}
-		printf(cmd.Root().Writer, "%s", err.Error())
-		printf(cmd.Root().Writer, "Select one of your organizations instead.")
-	} else if !isInteractive() {
-		return nil, errors.New("must provide --public-namespace or an organization ID")
+		return setOrgPublicNamespace(ctx, cmd, c, org, suggestedNamespace(identifier, org))
 	}
-	return promptOrgPicker(orgs)
-}
-
-func promptOrgPicker(orgs []*apppb.Organization) (*apppb.Organization, error) {
-	if len(orgs) == 0 {
-		return nil, errors.New("you have no organizations. Create one at https://app.viam.com, then set a public namespace in Settings")
+	ns := strings.ToLower(identifier)
+	if isValidOrgID(identifier) || !isValidPublicNamespace(ns) {
+		return nil, err
 	}
-	opts := make([]huh.Option[string], 0, len(orgs))
-	byID := make(map[string]*apppb.Organization, len(orgs))
-	for _, org := range orgs {
-		byID[org.GetId()] = org
-		opts = append(opts, huh.NewOption(orgChoiceLabel(org), org.GetId()))
-	}
-	var selected string
-	form := huh.NewForm(
-		huh.NewGroup(
-			huh.NewSelect[string]().
-				Title("Organization").
-				Description("Modules are registered under your organization's public namespace.").
-				Options(opts...).
-				Value(&selected),
-		),
-	).WithHeight(25).WithWidth(88)
-	if err := form.Run(); err != nil {
-		return nil, errors.Wrap(err, "encountered an error selecting an organization")
-	}
-	org := byID[selected]
-	if org == nil {
-		return nil, errors.New("no organization selected")
-	}
-	return org, nil
+	return createOrgWithNamespace(ctx, cmd, c, identifier, ns)
 }
 
 func suggestedNamespace(typed string, org *apppb.Organization) string {
@@ -1096,50 +1038,24 @@ func suggestedNamespace(typed string, org *apppb.Organization) string {
 	return sanitizeNamespace(org.GetName())
 }
 
-func ensureOrgPublicNamespace(
+func setOrgPublicNamespace(
 	ctx context.Context,
 	cmd *cli.Command,
 	c *viamClient,
 	org *apppb.Organization,
-	suggestion string,
+	ns string,
 ) (*apppb.Organization, error) {
-	if !isInteractive() {
+	if !isValidPublicNamespace(ns) {
 		return nil, errors.Errorf(
-			"organization %q has no public namespace. Set one in the Viam app (organization dropdown → Settings), then retry",
-			org.GetName())
+			"cannot set public namespace %q on organization %q; use lowercase letters, numbers, and hyphens",
+			ns, org.GetName())
 	}
-
-	ns := suggestion
-	form := huh.NewForm(
-		huh.NewGroup(
-			huh.NewInput().
-				Title("Set a public namespace").
-				Description(fmt.Sprintf(
-					"Organization %q has no public namespace yet.\n"+
-						"Modules need one. This updates your org settings (same as the Viam app).",
-					org.GetName())).
-				Placeholder("my-namespace").
-				Value(&ns).
-				Validate(func(s string) error {
-					if !isValidPublicNamespace(s) {
-						return errors.New("namespace must be lowercase letters, numbers, and hyphens, and start with a letter")
-					}
-					return nil
-				}),
-		),
-	).WithHeight(25).WithWidth(88)
-	if err := form.Run(); err != nil {
-		return nil, errors.Wrap(err, "encountered an error setting a public namespace")
-	}
-
 	resp, err := c.client.UpdateOrganization(ctx, &apppb.UpdateOrganizationRequest{
 		OrganizationId:  org.GetId(),
 		PublicNamespace: &ns,
 	})
 	if err != nil {
-		return nil, errors.Wrapf(err,
-			"failed to set public namespace %q on organization %q. You can also set it in the Viam app: organization dropdown → Settings",
-			ns, org.GetName())
+		return nil, errors.Wrapf(err, "failed to set public namespace %q on organization %q", ns, org.GetName())
 	}
 	c.orgs = nil
 	updated := resp.GetOrganization()
@@ -1149,6 +1065,28 @@ func ensureOrgPublicNamespace(
 	}
 	printf(cmd.Root().Writer, "Set public namespace %q on organization %q", updated.GetPublicNamespace(), updated.GetName())
 	return updated, nil
+}
+
+func createOrgWithNamespace(
+	ctx context.Context,
+	cmd *cli.Command,
+	c *viamClient,
+	name, ns string,
+) (*apppb.Organization, error) {
+	created, err := c.client.CreateOrganization(ctx, &apppb.CreateOrganizationRequest{Name: name})
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to create organization %q", name)
+	}
+	org := created.GetOrganization()
+	if org == nil {
+		return nil, errors.Errorf("failed to create organization %q: empty response", name)
+	}
+	printf(cmd.Root().Writer, "Created organization %q", org.GetName())
+	if org.GetPublicNamespace() == ns {
+		c.orgs = nil
+		return org, nil
+	}
+	return setOrgPublicNamespace(ctx, cmd, c, org, ns)
 }
 
 // TODO(RSDK-9758) - this logic will never be relevant currently because we're now checking if
@@ -1244,41 +1182,6 @@ func recentNamespaceHint(recent []string) string {
 		n = maxRecentModuleNamespaces
 	}
 	return "Recently used: " + strings.Join(recent[:n], ", ")
-}
-
-func firstOrgNamespace(orgs []*apppb.Organization) string {
-	for _, org := range orgs {
-		if ns := org.GetPublicNamespace(); ns != "" {
-			return ns
-		}
-	}
-	if len(orgs) > 0 && orgs[0].GetName() != "" {
-		return orgs[0].GetName()
-	}
-	return ""
-}
-
-func namespaceChoiceText(recent []string, orgs []*apppb.Organization) string {
-	var b strings.Builder
-	if hint := recentNamespaceHint(recent); hint != "" {
-		b.WriteString(hint)
-	}
-	if len(orgs) == 0 {
-		return b.String()
-	}
-	if b.Len() > 0 {
-		b.WriteString("\n")
-	}
-	b.WriteString("Your organizations:")
-	n := len(orgs)
-	if n > maxRecentModuleNamespaces {
-		n = maxRecentModuleNamespaces
-	}
-	for _, org := range orgs[:n] {
-		b.WriteString("\n  ")
-		b.WriteString(orgChoiceLabel(org))
-	}
-	return b.String()
 }
 
 func dedupeKeepOrder(vals []string) []string {
