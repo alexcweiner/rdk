@@ -5281,18 +5281,13 @@ func (c *viamClient) getOrg(ctx context.Context, orgStr string) (*apppb.Organiza
 	return nil, errors.Errorf("no organization found for %q", orgStr)
 }
 
-// getUserOrgByPublicNamespace searches the logged in users orgs to see
-// if any have a matching public namespace.
+// getUserOrgByPublicNamespace searches the logged in user's orgs by public
+// namespace, organization name, or organization ID.
 func (c *viamClient) getUserOrgByPublicNamespace(ctx context.Context, publicNamespace string) (*apppb.Organization, error) {
 	if err := c.loadOrganizations(ctx); err != nil {
 		return nil, err
 	}
-	for _, org := range *c.orgs {
-		if org.PublicNamespace == publicNamespace {
-			return org, nil
-		}
-	}
-	return nil, errors.Errorf("none of your organizations have a public namespace of %q", publicNamespace)
+	return findUserOrg(*c.orgs, publicNamespace)
 }
 
 func (c *viamClient) listOrganizations(ctx context.Context) ([]*apppb.Organization, error) {

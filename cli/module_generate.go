@@ -26,6 +26,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/russross/blackfriday/v2"
 	"github.com/urfave/cli/v3"
+	apppb "go.viam.com/api/app/v1"
 	"go.viam.com/utils"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
@@ -101,6 +102,10 @@ func GenerateModuleAction(ctx context.Context, cmd *cli.Command, args generateMo
 		}
 		shouldContinueGeneration := promptUnauthenticated()
 		if !shouldContinueGeneration {
+			return err
+		}
+		c, err = newViamClientInner(ctx, cmd, false)
+		if err != nil {
 			return err
 		}
 	}
@@ -182,7 +187,7 @@ func (c *viamClient) generateModuleAction(ctx context.Context, cmd *cli.Command,
 		RegisterOnApp: args.Register,
 	}
 	if shared.Visibility == "" || shared.Namespace == "" {
-		if err := promptSharedInputs(shared); err != nil {
+		if err := promptSharedInputs(ctx, cmd, c, shared); err != nil {
 			return err
 		}
 	}
@@ -764,7 +769,7 @@ type sharedInputs struct {
 }
 
 // promptSharedInputs prompts for visibility, namespace, and registration — shared across module and app flows.
-func promptSharedInputs(shared *sharedInputs) error {
+func promptSharedInputs(ctx context.Context, cmd *cli.Command, c *viamClient, shared *sharedInputs) error {
 	var registerWidget huh.Field
 	if unauthenticatedMode {
 		registerWidget = huh.NewSelect[bool]().
@@ -784,31 +789,76 @@ func promptSharedInputs(shared *sharedInputs) error {
 			Value(&shared.RegisterOnApp)
 	}
 
-	form := huh.NewForm(
-		huh.NewGroup(
-			huh.NewSelect[string]().
-				Title("Visibility:").
-				Options(
-					huh.NewOption("Public", moduleVisibilityPublic),
-					huh.NewOption("Private", moduleVisibilityPrivate),
-					huh.NewOption("Public Unlisted", moduleVisibilityPublicUnlisted),
-				).
-				Value(&shared.Visibility),
-			huh.NewInput().
-				Title("Namespace/Organization ID").
-				Value(&shared.Namespace).
-				Placeholder("my-namespace").
-				Validate(func(s string) error {
-					if s == "" {
-						return errors.New("namespace or org ID must not be empty")
-					}
-					return nil
-				}),
-			registerWidget,
-		),
-	).WithHeight(25).WithWidth(88)
+	fields := []huh.Field{}
+	if shared.Visibility == "" {
+		fields = append(fields, huh.NewSelect[string]().
+			Title("Visibility:").
+			Options(
+				huh.NewOption("Public", moduleVisibilityPublic),
+				huh.NewOption("Private", moduleVisibilityPrivate),
+				huh.NewOption("Public Unlisted", moduleVisibilityPublicUnlisted),
+			).
+			Value(&shared.Visibility))
+	}
+
+	var selectedOrgID string
+	orgsByID := map[string]*apppb.Organization{}
+	useOrgPicker := false
+	if shared.Namespace == "" && !unauthenticatedMode && c != nil && c.client != nil {
+		orgs, err := c.listOrganizations(ctx)
+		if err != nil {
+			warningf(cmd.Root().Writer, "Could not list organizations (%v); enter a namespace or org ID instead", err)
+		} else if len(orgs) > 0 {
+			useOrgPicker = true
+			opts := make([]huh.Option[string], 0, len(orgs))
+			for _, org := range orgs {
+				orgsByID[org.GetId()] = org
+				opts = append(opts, huh.NewOption(orgChoiceLabel(org), org.GetId()))
+			}
+			fields = append(fields, huh.NewSelect[string]().
+				Title("Organization").
+				Description("Modules are registered under your organization's public namespace.\n"+
+					"If an org has none yet, you can set one in the next step.").
+				Options(opts...).
+				Value(&selectedOrgID))
+		}
+	}
+	if shared.Namespace == "" && !useOrgPicker {
+		fields = append(fields, huh.NewInput().
+			Title("Namespace/Organization ID").
+			Description("Your org's public namespace, name, or ID.").
+			Value(&shared.Namespace).
+			Placeholder("my-namespace").
+			Validate(func(s string) error {
+				if s == "" {
+					return errors.New("namespace or org ID must not be empty")
+				}
+				return nil
+			}))
+	}
+
+	fields = append(fields, registerWidget)
+	form := huh.NewForm(huh.NewGroup(fields...)).WithHeight(25).WithWidth(88)
 	if err := form.Run(); err != nil {
 		return errors.Wrap(err, "encountered an error in shared prompts")
+	}
+
+	if useOrgPicker {
+		org := orgsByID[selectedOrgID]
+		if org == nil {
+			return errors.New("no organization selected")
+		}
+		if org.GetPublicNamespace() != "" {
+			shared.Namespace = org.GetPublicNamespace()
+		} else if !shared.RegisterOnApp {
+			shared.Namespace = sanitizeNamespace(org.GetName())
+			if shared.Namespace == "" {
+				shared.Namespace = org.GetId()
+			}
+		} else {
+			// wrapResolveOrg will match this ID and prompt to set a public namespace.
+			shared.Namespace = org.GetId()
+		}
 	}
 	return nil
 }
@@ -956,27 +1006,135 @@ func wrapResolveOrg(ctx context.Context, cmd *cli.Command, c *viamClient, newMod
 		return nil
 	}
 
-	uuidMatch, err := regexp.MatchString("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", newModule.Namespace)
-	if !uuidMatch || err != nil {
-		// If newModule.Namespace is NOT a UUID
-		org, err := resolveOrg(ctx, c, newModule.Namespace, "")
-		if err != nil {
-			return catchResolveOrgErr(ctx, cmd, c, newModule, err)
-		}
-		newModule.OrgID = org.GetId()
-	} else {
-		// If newModule.Namespace is a UUID/OrgID
-		org, err := resolveOrg(ctx, c, "", newModule.Namespace)
-		if err != nil {
-			return catchResolveOrgErr(ctx, cmd, c, newModule, err)
-		}
-		newModule.OrgID = newModule.Namespace
-		newModule.Namespace = org.GetPublicNamespace()
-		if newModule.Namespace == "" {
-			return errors.New("cannot create module in an organization with no public namespace. Set a namespace for your organization")
-		}
+	org, err := resolveOrgForModule(ctx, cmd, c, newModule.Namespace)
+	if err != nil {
+		return catchResolveOrgErr(ctx, cmd, c, newModule, err)
 	}
+	newModule.OrgID = org.GetId()
+	if ns := org.GetPublicNamespace(); ns != "" {
+		newModule.Namespace = ns
+		return nil
+	}
+	org, err = ensureOrgPublicNamespace(ctx, cmd, c, org, suggestedNamespace(newModule.Namespace, org))
+	if err != nil {
+		return err
+	}
+	newModule.OrgID = org.GetId()
+	newModule.Namespace = org.GetPublicNamespace()
 	return nil
+}
+
+func resolveOrgForModule(ctx context.Context, cmd *cli.Command, c *viamClient, identifier string) (*apppb.Organization, error) {
+	orgs, err := c.listOrganizations(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(identifier) != "" {
+		org, err := findUserOrg(orgs, identifier)
+		if err == nil {
+			return org, nil
+		}
+		if !isInteractive() {
+			return nil, err
+		}
+		printf(cmd.Root().Writer, "%s", err.Error())
+		printf(cmd.Root().Writer, "Select one of your organizations instead.")
+	} else if !isInteractive() {
+		return nil, errors.New("must provide --public-namespace or an organization ID")
+	}
+	return promptOrgPicker(orgs)
+}
+
+func promptOrgPicker(orgs []*apppb.Organization) (*apppb.Organization, error) {
+	if len(orgs) == 0 {
+		return nil, errors.New("you have no organizations. Create one at https://app.viam.com, then set a public namespace in Settings")
+	}
+	opts := make([]huh.Option[string], 0, len(orgs))
+	byID := make(map[string]*apppb.Organization, len(orgs))
+	for _, org := range orgs {
+		byID[org.GetId()] = org
+		opts = append(opts, huh.NewOption(orgChoiceLabel(org), org.GetId()))
+	}
+	var selected string
+	form := huh.NewForm(
+		huh.NewGroup(
+			huh.NewSelect[string]().
+				Title("Organization").
+				Description("Modules are registered under your organization's public namespace.").
+				Options(opts...).
+				Value(&selected),
+		),
+	).WithHeight(25).WithWidth(88)
+	if err := form.Run(); err != nil {
+		return nil, errors.Wrap(err, "encountered an error selecting an organization")
+	}
+	org := byID[selected]
+	if org == nil {
+		return nil, errors.New("no organization selected")
+	}
+	return org, nil
+}
+
+func suggestedNamespace(typed string, org *apppb.Organization) string {
+	if typed != "" && !isValidOrgID(typed) && isValidPublicNamespace(strings.ToLower(typed)) {
+		return strings.ToLower(typed)
+	}
+	return sanitizeNamespace(org.GetName())
+}
+
+func ensureOrgPublicNamespace(
+	ctx context.Context,
+	cmd *cli.Command,
+	c *viamClient,
+	org *apppb.Organization,
+	suggestion string,
+) (*apppb.Organization, error) {
+	if !isInteractive() {
+		return nil, errors.Errorf(
+			"organization %q has no public namespace. Set one in the Viam app (organization dropdown → Settings), then retry",
+			org.GetName())
+	}
+
+	ns := suggestion
+	form := huh.NewForm(
+		huh.NewGroup(
+			huh.NewInput().
+				Title("Set a public namespace").
+				Description(fmt.Sprintf(
+					"Organization %q has no public namespace yet.\n"+
+						"Modules need one. This updates your org settings (same as the Viam app).",
+					org.GetName())).
+				Placeholder("my-namespace").
+				Value(&ns).
+				Validate(func(s string) error {
+					if !isValidPublicNamespace(s) {
+						return errors.New("namespace must be lowercase letters, numbers, and hyphens, and start with a letter")
+					}
+					return nil
+				}),
+		),
+	).WithHeight(25).WithWidth(88)
+	if err := form.Run(); err != nil {
+		return nil, errors.Wrap(err, "encountered an error setting a public namespace")
+	}
+
+	resp, err := c.client.UpdateOrganization(ctx, &apppb.UpdateOrganizationRequest{
+		OrganizationId:  org.GetId(),
+		PublicNamespace: &ns,
+	})
+	if err != nil {
+		return nil, errors.Wrapf(err,
+			"failed to set public namespace %q on organization %q. You can also set it in the Viam app: organization dropdown → Settings",
+			ns, org.GetName())
+	}
+	c.orgs = nil
+	updated := resp.GetOrganization()
+	if updated == nil || updated.GetPublicNamespace() == "" {
+		org.PublicNamespace = ns
+		updated = org
+	}
+	printf(cmd.Root().Writer, "Set public namespace %q on organization %q", updated.GetPublicNamespace(), updated.GetName())
+	return updated, nil
 }
 
 // TODO(RSDK-9758) - this logic will never be relevant currently because we're now checking if
@@ -995,10 +1153,6 @@ func catchResolveOrgErr(ctx context.Context, cmd *cli.Command, c *viamClient, ne
 			return err
 		}
 		return wrapResolveOrg(ctx, cmd, c, newModule)
-	}
-	if strings.Contains(caughtErr.Error(), "none of your organizations have a public namespace") ||
-		strings.Contains(caughtErr.Error(), "no organization found for") {
-		return errors.Wrapf(caughtErr, "cannot create module for an organization of which you are not a member")
 	}
 	return caughtErr
 }

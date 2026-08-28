@@ -847,6 +847,96 @@ func isValidOrgID(str string) bool {
 	return err == nil
 }
 
+var (
+	publicNamespacePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	nonNamespaceChars      = regexp.MustCompile(`[^a-z0-9-]+`)
+)
+
+// orgNotFoundError is returned when a user-supplied org identifier does not match
+// any organization the user belongs to.
+type orgNotFoundError struct {
+	identifier string
+	orgs       []*apppb.Organization
+}
+
+func (e *orgNotFoundError) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "none of your organizations match %q (looked up public namespace, name, and ID)", e.identifier)
+	if len(e.orgs) == 0 {
+		b.WriteString("\nYou have no organizations. Create one at https://app.viam.com")
+		return b.String()
+	}
+	b.WriteString("\nYour organizations:")
+	for _, org := range e.orgs {
+		fmt.Fprintf(&b, "\n  - %s  (id: %s)", orgChoiceLabel(org), org.GetId())
+	}
+	b.WriteString("\nIf the org exists but has no public namespace, set one in the Viam app: organization dropdown → Settings.")
+	return b.String()
+}
+
+func orgChoiceLabel(org *apppb.Organization) string {
+	if org.GetPublicNamespace() != "" {
+		return fmt.Sprintf("%s  (namespace: %s)", org.GetName(), org.GetPublicNamespace())
+	}
+	return fmt.Sprintf("%s  (no public namespace)", org.GetName())
+}
+
+// findUserOrg locates one of the user's organizations by public namespace, name, or ID.
+// Matching is case-insensitive for namespace and name.
+func findUserOrg(orgs []*apppb.Organization, identifier string) (*apppb.Organization, error) {
+	ident := strings.TrimSpace(identifier)
+	if ident == "" {
+		return nil, errors.New("must provide an organization namespace, name, or ID")
+	}
+
+	var byName []*apppb.Organization
+	for _, org := range orgs {
+		if org.GetId() == ident {
+			return org, nil
+		}
+		if org.GetPublicNamespace() != "" && strings.EqualFold(org.GetPublicNamespace(), ident) {
+			return org, nil
+		}
+		if strings.EqualFold(org.GetName(), ident) {
+			byName = append(byName, org)
+		}
+	}
+	if len(byName) == 1 {
+		return byName[0], nil
+	}
+	if len(byName) > 1 {
+		return nil, errors.Errorf(
+			"multiple organizations named %q; use a public namespace or org ID instead:\n%s",
+			ident, formatOrgList(byName))
+	}
+	return nil, &orgNotFoundError{identifier: ident, orgs: orgs}
+}
+
+func formatOrgList(orgs []*apppb.Organization) string {
+	lines := make([]string, 0, len(orgs))
+	for _, org := range orgs {
+		lines = append(lines, fmt.Sprintf("  - %s  (id: %s)", orgChoiceLabel(org), org.GetId()))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func sanitizeNamespace(name string) string {
+	s := strings.ToLower(strings.TrimSpace(name))
+	s = nonNamespaceChars.ReplaceAllString(s, "-")
+	s = strings.Trim(s, "-")
+	if s == "" {
+		return ""
+	}
+	if s[0] < 'a' || s[0] > 'z' {
+		s = "org-" + s
+	}
+	return s
+}
+
+func isValidPublicNamespace(ns string) bool {
+	return publicNamespacePattern.MatchString(ns)
+}
+
 func loadManifest(manifestPath string) (ModuleManifest, error) {
 	//nolint:gosec
 	manifestBytes, err := os.ReadFile(manifestPath)
