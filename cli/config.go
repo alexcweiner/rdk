@@ -135,6 +135,9 @@ type Config struct {
 	profile         string
 	DefaultOrg      string `json:"default_org"`
 	DefaultLocation string `json:"default_location"`
+	// RecentModuleNamespaces is the last few values typed or resolved for
+	// `viam module generate` (public namespace, org name, or org ID).
+	RecentModuleNamespaces []string `json:"recent_module_namespaces,omitempty"`
 }
 
 func (conf *Config) tryUnmarshallWithToken(configBytes []byte) error {

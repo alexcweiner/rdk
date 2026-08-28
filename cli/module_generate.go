@@ -792,11 +792,25 @@ func promptSharedInputs(ctx context.Context, cmd *cli.Command, c *viamClient, sh
 			Value(&shared.RegisterOnApp)
 	}
 
+	namespaceDesc := "Public namespace, organization name, or org ID. You can type it."
+	placeholder := "my-namespace"
+	suggestions := []string{}
+	if c != nil && c.conf != nil {
+		recent := c.conf.RecentModuleNamespaces
+		if hint := recentNamespaceHint(recent); hint != "" {
+			namespaceDesc += "\n" + hint
+		}
+		if len(recent) > 0 {
+			placeholder = recent[0]
+			suggestions = append(suggestions, recent...)
+		}
+	}
+
 	namespaceInput := huh.NewInput().
 		Title("Namespace/Organization ID").
-		Description("Public namespace, organization name, or org ID.").
+		Description(namespaceDesc).
 		Value(&shared.Namespace).
-		Placeholder("my-namespace").
+		Placeholder(placeholder).
 		Validate(func(s string) error {
 			if s == "" {
 				return errors.New("namespace or org ID must not be empty")
@@ -806,8 +820,7 @@ func promptSharedInputs(ctx context.Context, cmd *cli.Command, c *viamClient, sh
 	if !unauthenticatedMode && c != nil && c.client != nil {
 		if orgs, err := c.listOrganizations(ctx); err != nil {
 			warningf(cmd.Root().Writer, "Could not list organizations (%v); type a namespace, org name, or org ID", err)
-		} else if len(orgs) > 0 {
-			suggestions := make([]string, 0, len(orgs)*2)
+		} else {
 			for _, org := range orgs {
 				if ns := org.GetPublicNamespace(); ns != "" {
 					suggestions = append(suggestions, ns)
@@ -816,8 +829,10 @@ func promptSharedInputs(ctx context.Context, cmd *cli.Command, c *viamClient, sh
 					suggestions = append(suggestions, name)
 				}
 			}
-			namespaceInput = namespaceInput.Suggestions(suggestions)
 		}
+	}
+	if len(suggestions) > 0 {
+		namespaceInput = namespaceInput.Suggestions(dedupeKeepOrder(suggestions))
 	}
 
 	form := huh.NewForm(
@@ -976,10 +991,12 @@ func promptAddModelInputs(module *modulegen.ModuleInputs) error {
 func wrapResolveOrg(ctx context.Context, cmd *cli.Command, c *viamClient, newModule *modulegen.ModuleInputs) error {
 	// If we're not registering on app, we don't need to resolve the org
 	if !newModule.RegisterOnApp {
+		typed := strings.TrimSpace(newModule.Namespace)
 		nonAlphanumericRegex := regexp.MustCompile(`[^a-zA-Z0-9]+`)
 		cleanNamespace := nonAlphanumericRegex.ReplaceAllString(newModule.Namespace, "")
 		newModule.Namespace = cleanNamespace
 		newModule.OrgID = newModule.Namespace
+		rememberRecentModuleNamespace(c, typed)
 		return nil
 	}
 
@@ -990,6 +1007,7 @@ func wrapResolveOrg(ctx context.Context, cmd *cli.Command, c *viamClient, newMod
 	newModule.OrgID = org.GetId()
 	if ns := org.GetPublicNamespace(); ns != "" {
 		newModule.Namespace = ns
+		rememberRecentModuleNamespace(c, newModule.Namespace)
 		return nil
 	}
 	org, err = ensureOrgPublicNamespace(ctx, cmd, c, org, suggestedNamespace(newModule.Namespace, org))
@@ -998,6 +1016,7 @@ func wrapResolveOrg(ctx context.Context, cmd *cli.Command, c *viamClient, newMod
 	}
 	newModule.OrgID = org.GetId()
 	newModule.Namespace = org.GetPublicNamespace()
+	rememberRecentModuleNamespace(c, newModule.Namespace)
 	return nil
 }
 
@@ -1132,6 +1151,69 @@ func catchResolveOrgErr(ctx context.Context, cmd *cli.Command, c *viamClient, ne
 		return wrapResolveOrg(ctx, cmd, c, newModule)
 	}
 	return caughtErr
+}
+
+const maxRecentModuleNamespaces = 5
+
+// persistCLIConfig writes CLI config to disk. Tests replace this to avoid
+// overwriting the developer's cached credentials.
+var persistCLIConfig = storeConfigToCache
+
+func rememberRecentModuleNamespace(c *viamClient, ns string) {
+	if c == nil || c.conf == nil {
+		return
+	}
+	ns = strings.TrimSpace(ns)
+	if ns == "" {
+		return
+	}
+	c.conf.RecentModuleNamespaces = prependRecent(c.conf.RecentModuleNamespaces, ns, maxRecentModuleNamespaces)
+	if persistCLIConfig != nil {
+		_ = persistCLIConfig(c.conf)
+	}
+}
+
+func prependRecent(existing []string, val string, maxN int) []string {
+	out := make([]string, 0, maxN)
+	out = append(out, val)
+	for _, s := range existing {
+		if strings.EqualFold(s, val) {
+			continue
+		}
+		out = append(out, s)
+		if len(out) >= maxN {
+			break
+		}
+	}
+	return out
+}
+
+func recentNamespaceHint(recent []string) string {
+	if len(recent) == 0 {
+		return ""
+	}
+	n := len(recent)
+	if n > maxRecentModuleNamespaces {
+		n = maxRecentModuleNamespaces
+	}
+	return "Recently used: " + strings.Join(recent[:n], ", ")
+}
+
+func dedupeKeepOrder(vals []string) []string {
+	seen := make(map[string]struct{}, len(vals))
+	out := make([]string, 0, len(vals))
+	for _, v := range vals {
+		key := strings.ToLower(strings.TrimSpace(v))
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, v)
+	}
+	return out
 }
 
 // populateAdditionalInfo fills in additional info in newModule.

@@ -99,6 +99,10 @@ func TestSanitizeAndSuggestNamespace(t *testing.T) {
 }
 
 func TestWrapResolveOrg(t *testing.T) {
+	origPersist := persistCLIConfig
+	persistCLIConfig = func(*Config) error { return nil }
+	t.Cleanup(func() { persistCLIConfig = origPersist })
+
 	listOrgs := func(orgs []*apppb.Organization) *inject.AppServiceClient {
 		return &inject.AppServiceClient{
 			ListOrganizationsFunc: func(ctx context.Context, in *apppb.ListOrganizationsRequest,
@@ -117,6 +121,7 @@ func TestWrapResolveOrg(t *testing.T) {
 		test.That(t, wrapResolveOrg(context.Background(), cCtx, ac, mod), test.ShouldBeNil)
 		test.That(t, mod.OrgID, test.ShouldEqual, "11111111-1111-1111-1111-111111111111")
 		test.That(t, mod.Namespace, test.ShouldEqual, "otf")
+		test.That(t, ac.conf.RecentModuleNamespaces, test.ShouldResemble, []string{"otf"})
 	})
 
 	t.Run("org name without namespace is a clear error, not membership", func(t *testing.T) {
@@ -129,6 +134,7 @@ func TestWrapResolveOrg(t *testing.T) {
 		test.That(t, err.Error(), test.ShouldContainSubstring, "no public namespace")
 		test.That(t, err.Error(), test.ShouldContainSubstring, "Settings")
 		test.That(t, err.Error(), test.ShouldNotContainSubstring, "not a member")
+		test.That(t, len(ac.conf.RecentModuleNamespaces), test.ShouldEqual, 0)
 	})
 
 	t.Run("unknown identifier lists orgs and does not claim non-membership", func(t *testing.T) {
@@ -147,7 +153,18 @@ func TestWrapResolveOrg(t *testing.T) {
 		test.That(t, wrapResolveOrg(context.Background(), cCtx, ac, mod), test.ShouldBeNil)
 		test.That(t, mod.Namespace, test.ShouldEqual, "myorg")
 		test.That(t, mod.OrgID, test.ShouldEqual, "myorg")
+		test.That(t, ac.conf.RecentModuleNamespaces, test.ShouldResemble, []string{"my-org"})
 	})
+}
+
+func TestRecentModuleNamespaces(t *testing.T) {
+	t.Parallel()
+	test.That(t, prependRecent([]string{"acme", "widgets"}, "otf", 5), test.ShouldResemble, []string{"otf", "acme", "widgets"})
+	test.That(t, prependRecent([]string{"otf", "acme"}, "OTF", 5), test.ShouldResemble, []string{"OTF", "acme"})
+	test.That(t, prependRecent([]string{"a", "b", "c", "d", "e"}, "f", 5), test.ShouldResemble, []string{"f", "a", "b", "c", "d"})
+	test.That(t, recentNamespaceHint(nil), test.ShouldEqual, "")
+	test.That(t, recentNamespaceHint([]string{"otf", "acme"}), test.ShouldEqual, "Recently used: otf, acme")
+	test.That(t, dedupeKeepOrder([]string{"otf", "OTF", "acme", ""}), test.ShouldResemble, []string{"otf", "acme"})
 }
 
 func TestOrgChoiceLabel(t *testing.T) {
