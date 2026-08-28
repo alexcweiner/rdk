@@ -11,6 +11,7 @@ import (
 
 	"go.viam.com/rdk/cli/module_generate/modulegen"
 	"go.viam.com/rdk/testutils/inject"
+	rutils "go.viam.com/rdk/utils"
 )
 
 func testOrgs() []*apppb.Organization {
@@ -99,9 +100,13 @@ func TestSanitizeAndSuggestNamespace(t *testing.T) {
 }
 
 func TestWrapResolveOrg(t *testing.T) {
-	origPersist := persistCLIConfig
-	persistCLIConfig = func(*Config) error { return nil }
-	t.Cleanup(func() { persistCLIConfig = origPersist })
+	origRead, origWrite := readRecentModuleNamespaces, writeRecentModuleNamespaces
+	readRecentModuleNamespaces = func() []string { return nil }
+	writeRecentModuleNamespaces = func([]string) error { return nil }
+	t.Cleanup(func() {
+		readRecentModuleNamespaces = origRead
+		writeRecentModuleNamespaces = origWrite
+	})
 
 	listOrgs := func(orgs []*apppb.Organization) *inject.AppServiceClient {
 		return &inject.AppServiceClient{
@@ -165,6 +170,29 @@ func TestRecentModuleNamespaces(t *testing.T) {
 	test.That(t, recentNamespaceHint(nil), test.ShouldEqual, "")
 	test.That(t, recentNamespaceHint([]string{"otf", "acme"}), test.ShouldEqual, "Recently used: otf, acme")
 	test.That(t, dedupeKeepOrder([]string{"otf", "OTF", "acme", ""}), test.ShouldResemble, []string{"otf", "acme"})
+	test.That(t, namespaceChoiceText([]string{"otf"}, testOrgs()), test.ShouldContainSubstring, "Recently used: otf")
+	test.That(t, namespaceChoiceText([]string{"otf"}, testOrgs()), test.ShouldContainSubstring, "Your organizations:")
+	test.That(t, namespaceChoiceText([]string{"otf"}, testOrgs()), test.ShouldContainSubstring, "namespace: acme")
+	test.That(t, firstOrgNamespace(testOrgs()), test.ShouldEqual, "acme")
+}
+
+func TestRecentModuleNamespacesFile(t *testing.T) {
+	origDir := rutils.ViamDotDir
+	rutils.ViamDotDir = t.TempDir()
+	t.Cleanup(func() { rutils.ViamDotDir = origDir })
+
+	origRead, origWrite := readRecentModuleNamespaces, writeRecentModuleNamespaces
+	readRecentModuleNamespaces = loadRecentModuleNamespacesFromDisk
+	writeRecentModuleNamespaces = saveRecentModuleNamespacesToDisk
+	t.Cleanup(func() {
+		readRecentModuleNamespaces = origRead
+		writeRecentModuleNamespaces = origWrite
+	})
+
+	rememberRecentModuleNamespace(&viamClient{conf: &Config{}}, "otf")
+	test.That(t, loadRecentModuleNamespacesFromDisk(), test.ShouldResemble, []string{"otf"})
+	rememberRecentModuleNamespace(&viamClient{conf: &Config{}}, "acme")
+	test.That(t, loadRecentModuleNamespacesFromDisk(), test.ShouldResemble, []string{"acme", "otf"})
 }
 
 func TestOrgChoiceLabel(t *testing.T) {

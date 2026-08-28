@@ -33,6 +33,7 @@ import (
 
 	"go.viam.com/rdk/cli/module_generate/modulegen"
 	gen "go.viam.com/rdk/cli/module_generate/scripts"
+	rutils "go.viam.com/rdk/utils"
 )
 
 //go:embed module_generate/scripts
@@ -795,15 +796,47 @@ func promptSharedInputs(ctx context.Context, cmd *cli.Command, c *viamClient, sh
 	namespaceDesc := "Public namespace, organization name, or org ID. You can type it."
 	placeholder := "my-namespace"
 	suggestions := []string{}
-	if c != nil && c.conf != nil {
-		recent := c.conf.RecentModuleNamespaces
-		if hint := recentNamespaceHint(recent); hint != "" {
-			namespaceDesc += "\n" + hint
+	var orgs []*apppb.Organization
+	if !unauthenticatedMode && c != nil && c.client != nil {
+		listed, err := c.listOrganizations(ctx)
+		if err != nil {
+			warningf(cmd.Root().Writer, "Could not list organizations (%v); type a namespace, org name, or org ID", err)
+		} else {
+			orgs = listed
 		}
-		if len(recent) > 0 {
-			placeholder = recent[0]
-			suggestions = append(suggestions, recent...)
+	}
+
+	recent := readRecentModuleNamespaces()
+	if len(recent) == 0 && c != nil && c.conf != nil {
+		recent = c.conf.RecentModuleNamespaces
+	}
+	if hint := recentNamespaceHint(recent); hint != "" {
+		// huh only reliably shows a single description line on the input.
+		namespaceDesc = hint + ". You can type it."
+	}
+	if len(recent) > 0 {
+		placeholder = recent[0]
+		suggestions = append(suggestions, recent...)
+	}
+	for _, org := range orgs {
+		if ns := org.GetPublicNamespace(); ns != "" {
+			suggestions = append(suggestions, ns)
 		}
+		if name := org.GetName(); name != "" {
+			suggestions = append(suggestions, name)
+		}
+	}
+	if placeholder == "my-namespace" {
+		if ns := firstOrgNamespace(orgs); ns != "" {
+			placeholder = ns
+		}
+	}
+
+	fields := []huh.Field{}
+	if note := namespaceChoiceText(recent, orgs); note != "" {
+		fields = append(fields, huh.NewNote().
+			Title("Type a namespace, org name, or org ID below").
+			Description(note))
 	}
 
 	namespaceInput := huh.NewInput().
@@ -817,38 +850,23 @@ func promptSharedInputs(ctx context.Context, cmd *cli.Command, c *viamClient, sh
 			}
 			return nil
 		})
-	if !unauthenticatedMode && c != nil && c.client != nil {
-		if orgs, err := c.listOrganizations(ctx); err != nil {
-			warningf(cmd.Root().Writer, "Could not list organizations (%v); type a namespace, org name, or org ID", err)
-		} else {
-			for _, org := range orgs {
-				if ns := org.GetPublicNamespace(); ns != "" {
-					suggestions = append(suggestions, ns)
-				}
-				if name := org.GetName(); name != "" {
-					suggestions = append(suggestions, name)
-				}
-			}
-		}
-	}
 	if len(suggestions) > 0 {
 		namespaceInput = namespaceInput.Suggestions(dedupeKeepOrder(suggestions))
 	}
+	fields = append(fields,
+		huh.NewSelect[string]().
+			Title("Visibility:").
+			Options(
+				huh.NewOption("Public", moduleVisibilityPublic),
+				huh.NewOption("Private", moduleVisibilityPrivate),
+				huh.NewOption("Public Unlisted", moduleVisibilityPublicUnlisted),
+			).
+			Value(&shared.Visibility),
+		namespaceInput,
+		registerWidget,
+	)
 
-	form := huh.NewForm(
-		huh.NewGroup(
-			huh.NewSelect[string]().
-				Title("Visibility:").
-				Options(
-					huh.NewOption("Public", moduleVisibilityPublic),
-					huh.NewOption("Private", moduleVisibilityPrivate),
-					huh.NewOption("Public Unlisted", moduleVisibilityPublicUnlisted),
-				).
-				Value(&shared.Visibility),
-			namespaceInput,
-			registerWidget,
-		),
-	).WithHeight(25).WithWidth(88)
+	form := huh.NewForm(huh.NewGroup(fields...)).WithHeight(28).WithWidth(88)
 	if err := form.Run(); err != nil {
 		return errors.Wrap(err, "encountered an error in shared prompts")
 	}
@@ -1155,21 +1173,50 @@ func catchResolveOrgErr(ctx context.Context, cmd *cli.Command, c *viamClient, ne
 
 const maxRecentModuleNamespaces = 5
 
-// persistCLIConfig writes CLI config to disk. Tests replace this to avoid
-// overwriting the developer's cached credentials.
-var persistCLIConfig = storeConfigToCache
+func recentModuleNamespacesPath() string {
+	return filepath.Join(rutils.ViamDotDir, "module_generate_recents.json")
+}
+
+func loadRecentModuleNamespacesFromDisk() []string {
+	data, err := os.ReadFile(recentModuleNamespacesPath())
+	if err != nil {
+		return nil
+	}
+	var recents []string
+	if err := json.Unmarshal(data, &recents); err != nil {
+		return nil
+	}
+	return recents
+}
+
+func saveRecentModuleNamespacesToDisk(recents []string) error {
+	if err := os.MkdirAll(rutils.ViamDotDir, 0o700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(recents, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(recentModuleNamespacesPath(), data, 0o640)
+}
+
+// read/writeRecentModuleNamespaces are stubs so tests do not touch ~/.viam.
+var (
+	readRecentModuleNamespaces  = loadRecentModuleNamespacesFromDisk
+	writeRecentModuleNamespaces = saveRecentModuleNamespacesToDisk
+)
 
 func rememberRecentModuleNamespace(c *viamClient, ns string) {
-	if c == nil || c.conf == nil {
-		return
-	}
 	ns = strings.TrimSpace(ns)
 	if ns == "" {
 		return
 	}
-	c.conf.RecentModuleNamespaces = prependRecent(c.conf.RecentModuleNamespaces, ns, maxRecentModuleNamespaces)
-	if persistCLIConfig != nil {
-		_ = persistCLIConfig(c.conf)
+	updated := prependRecent(readRecentModuleNamespaces(), ns, maxRecentModuleNamespaces)
+	if c != nil && c.conf != nil {
+		c.conf.RecentModuleNamespaces = updated
+	}
+	if err := writeRecentModuleNamespaces(updated); err != nil {
+		warningf(os.Stderr, "Could not save recent module namespaces: %v", err)
 	}
 }
 
@@ -1197,6 +1244,41 @@ func recentNamespaceHint(recent []string) string {
 		n = maxRecentModuleNamespaces
 	}
 	return "Recently used: " + strings.Join(recent[:n], ", ")
+}
+
+func firstOrgNamespace(orgs []*apppb.Organization) string {
+	for _, org := range orgs {
+		if ns := org.GetPublicNamespace(); ns != "" {
+			return ns
+		}
+	}
+	if len(orgs) > 0 && orgs[0].GetName() != "" {
+		return orgs[0].GetName()
+	}
+	return ""
+}
+
+func namespaceChoiceText(recent []string, orgs []*apppb.Organization) string {
+	var b strings.Builder
+	if hint := recentNamespaceHint(recent); hint != "" {
+		b.WriteString(hint)
+	}
+	if len(orgs) == 0 {
+		return b.String()
+	}
+	if b.Len() > 0 {
+		b.WriteString("\n")
+	}
+	b.WriteString("Your organizations:")
+	n := len(orgs)
+	if n > maxRecentModuleNamespaces {
+		n = maxRecentModuleNamespaces
+	}
+	for _, org := range orgs[:n] {
+		b.WriteString("\n  ")
+		b.WriteString(orgChoiceLabel(org))
+	}
+	return b.String()
 }
 
 func dedupeKeepOrder(vals []string) []string {
